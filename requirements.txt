@@ -1,5 +1,4 @@
 python-docx
-pandas
 openpyxl
-regex
 spacy
+anthropic
