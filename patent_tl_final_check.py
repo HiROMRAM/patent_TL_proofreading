@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 import anthropic
+import openai
 from docx import Document
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
@@ -33,6 +34,7 @@ from openpyxl.styles import Alignment, Font
 # CONFIGURATION
 # ==========================================
 MODEL_NAME = "claude-opus-4-6"
+GPT_MODEL_NAME = "gpt-5.4"
 MAX_TOKENS = 4096
 WINDOW_SIZE = 7       # Context window for non-claim segments
 BLOCK_SIZE = 5        # Block size for non-claim segments
@@ -358,6 +360,28 @@ def group_into_check_batches(pairs: list[tuple[str, str]], jp_col: int) -> list[
 
 
 # ==========================================
+# API SELECTION
+# ==========================================
+
+def choose_api() -> str:
+    """Prompt user to choose between Claude and GPT API.
+
+    Returns 'claude' or 'gpt'.
+    """
+    print()
+    print("  Select API:")
+    print("    1. Claude API  (claude-opus-4-6)")
+    print("    2. GPT API     (gpt-5.4)")
+    choice = input("  Enter 1 or 2 [default: 1]: ").strip()
+    if choice == "2":
+        print(f"  → Using GPT API ({GPT_MODEL_NAME})")
+        return "gpt"
+    else:
+        print(f"  → Using Claude API ({MODEL_NAME})")
+        return "claude"
+
+
+# ==========================================
 # API INTERACTION
 # ==========================================
 
@@ -400,35 +424,56 @@ Target rows to check: {check_rows_str}
 
 
 def check_batch(
-    client: anthropic.Anthropic,
-    system_prompt_blocks: list[dict],
+    client,
+    system_prompt_blocks,
     pairs: list[tuple[str, str]],
     batch: dict,
     jp_col: int,
     en_col: int,
     direction: str,
+    api_choice: str = "claude",
 ) -> list[dict]:
-    """Send a batch to Claude API for QA checking."""
+    """Send a batch to Claude or GPT API for QA checking."""
     user_message = build_user_message(pairs, batch, jp_col, en_col, direction)
 
     try:
-        response = client.messages.create(
-            model=MODEL_NAME,
-            max_tokens=MAX_TOKENS,
-            system=system_prompt_blocks,
-            messages=[{"role": "user", "content": user_message}]
-        )
+        if api_choice == "gpt":
+            # OpenAI Chat Completions API
+            response = client.chat.completions.create(
+                model=GPT_MODEL_NAME,
+                max_completion_tokens=MAX_TOKENS,
+                reasoning_effort="high",
+                messages=[
+                    {"role": "system", "content": system_prompt_blocks},
+                    {"role": "user", "content": user_message},
+                ],
+            )
 
-        # Log cache performance
-        usage = response.usage
-        cache_read = getattr(usage, 'cache_read_input_tokens', 0)
-        cache_create = getattr(usage, 'cache_creation_input_tokens', 0)
-        if cache_create > 0:
-            print(f" [cache: wrote {cache_create}tok]", end="")
-        elif cache_read > 0:
-            print(f" [cache: read {cache_read}tok]", end="")
+            usage = response.usage
+            cached = getattr(usage, 'prompt_tokens_details', None)
+            if cached and getattr(cached, 'cached_tokens', 0) > 0:
+                print(f" [cache: {cached.cached_tokens}tok]", end="")
 
-        response_text = response.content[0].text
+            response_text = response.choices[0].message.content
+        else:
+            # Anthropic Messages API
+            response = client.messages.create(
+                model=MODEL_NAME,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt_blocks,
+                messages=[{"role": "user", "content": user_message}]
+            )
+
+            # Log cache performance
+            usage = response.usage
+            cache_read = getattr(usage, 'cache_read_input_tokens', 0)
+            cache_create = getattr(usage, 'cache_creation_input_tokens', 0)
+            if cache_create > 0:
+                print(f" [cache: wrote {cache_create}tok]", end="")
+            elif cache_read > 0:
+                print(f" [cache: read {cache_read}tok]", end="")
+
+            response_text = response.content[0].text
 
         json_match = re.search(r'\{[\s\S]*\}', response_text)
         if json_match:
@@ -452,6 +497,7 @@ def check_batch(
 def process_document(
     docx_path: str,
     output_path: str,
+    api_choice: str = "claude",
 ) -> None:
     """Process document and generate QA report."""
 
@@ -473,17 +519,21 @@ def process_document(
     # Select system prompt based on direction
     system_prompt_text = SYSTEM_PROMPT_JP2EN if direction == "JP2EN" else SYSTEM_PROMPT_EN2JP
 
-    # Initialize API client
-    client = anthropic.Anthropic()
-
-    # Build system prompt with caching
-    system_prompt_blocks = [
-        {
-            "type": "text",
-            "text": system_prompt_text,
-            "cache_control": {"type": "ephemeral"}
-        }
-    ]
+    # Initialize API client and system prompt
+    if api_choice == "gpt":
+        client = openai.OpenAI()
+        system_prompt_blocks = system_prompt_text  # plain string for OpenAI
+        active_model = GPT_MODEL_NAME
+    else:
+        client = anthropic.Anthropic()
+        system_prompt_blocks = [
+            {
+                "type": "text",
+                "text": system_prompt_text,
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]
+        active_model = MODEL_NAME
 
     # Group into batches
     batches = group_into_check_batches(pairs, jp_col)
@@ -495,7 +545,7 @@ def process_document(
     )
     print(f"  Claims detected: {claim_count}")
     print(f"  Batches: {len(batches)} ({claim_batches} claim, {non_claim_batches} non-claim)")
-    print(f"  Model: {MODEL_NAME}")
+    print(f"  Model: {active_model}")
 
     # Process batches
     all_issues: dict[int, list[str]] = {}  # 1-indexed row -> list of issue strings
@@ -517,7 +567,7 @@ def process_document(
         print(f"  Batch {batch_num}/{len(batches)} [{label}]...", end="", flush=True)
 
         issues = check_batch(client, system_prompt_blocks, pairs, batch,
-                             jp_col, en_col, direction)
+                             jp_col, en_col, direction, api_choice)
 
         # Collect issues (Claude returns 1-indexed row numbers)
         valid_check_rows = set(i + 1 for i in check_indices)
@@ -638,16 +688,47 @@ def process_document(
 
 
 # ==========================================
+# PUBLICATION SAFETY CHECK
+# ==========================================
+
+def confirm_published(filepath: str) -> bool:
+    """Ask user to confirm the input file contains only published content.
+
+    Returns True if confirmed, False otherwise.
+    """
+    print()
+    print("=" * 60)
+    print("  ⚠  PUBLICATION STATUS CHECK")
+    print("=" * 60)
+    print(f"  File: {Path(filepath).name}")
+    print()
+    print("  This script sends document content to the Claude/GPT API.")
+    print("  Only PUBLISHED patent documents should be processed.")
+    print("  Do NOT use this script for unpublished or confidential")
+    print("  documents.")
+    print("=" * 60)
+    answer = input("\n  Is this document already published? (y/N): ").strip().lower()
+    if answer not in ("y", "yes"):
+        print("\n  Aborted. Use a local LLM for unpublished documents.")
+        return False
+    return True
+
+
+# ==========================================
 # CLI & INTERACTIVE ENTRY POINTS
 # ==========================================
 
 def main_cli():
     """CLI mode with arguments."""
     parser = argparse.ArgumentParser(
-        description="Patent Translation QA Check using Claude API (auto-detects JP2EN / EN2JP)"
+        description="Patent Translation QA Check using Claude/GPT API (auto-detects JP2EN / EN2JP)"
     )
     parser.add_argument("input", help="Input docx file with translation table")
     parser.add_argument("-o", "--output", help="Output xlsx file")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Skip publication confirmation prompt")
+    parser.add_argument("--api", choices=["claude", "gpt"], default=None,
+                        help="API to use: claude or gpt (interactive if omitted)")
 
     args = parser.parse_args()
 
@@ -660,15 +741,18 @@ def main_cli():
         input_path.parent / (input_path.stem + "_qa_result.xlsx")
     )
 
-    process_document(str(input_path), str(output_path))
+    if not args.yes:
+        if not confirm_published(str(input_path)):
+            sys.exit(0)
+
+    api_choice = args.api if args.api else choose_api()
+    process_document(str(input_path), str(output_path), api_choice)
 
 
 def main_interactive():
     """Interactive mode."""
     print("=" * 60)
     print("  Patent Translation QA Check (auto-detect direction)")
-    print("=" * 60)
-    print(f"  Model: {MODEL_NAME}")
     print("=" * 60)
     print()
 
@@ -686,10 +770,15 @@ def main_interactive():
         input("\nPress Enter to exit...")
         sys.exit(1)
 
+    if not confirm_published(str(input_path)):
+        input("\nPress Enter to exit...")
+        sys.exit(0)
+
+    api_choice = choose_api()
     output_path = input_path.parent / (input_path.stem + "_qa_result.xlsx")
 
     print()
-    process_document(str(input_path), str(output_path))
+    process_document(str(input_path), str(output_path), api_choice)
 
     print()
     input("Press Enter to exit...")
